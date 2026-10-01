@@ -6,7 +6,7 @@
 |---|---|
 | **Project title** | PathTrace: Datapath Intent Tracing for SONiC |
 | **Team name** | `PathTrace` |
-| **Team members** | `Thovi Keerthi Kumar`, `Sandeep Kulambi`, … (up to 5) |
+| **Team members** | `Thovi Keerthi Kumar`, `Sandeep Kulambi` |
 | **Company / affiliation** | `PalC Networks` |
 | **Repository** | `[https://github.com/palcnetworks/Path-Trace/]` |
 | **Topic** | Debugging and root-cause analysis |
@@ -84,10 +84,6 @@ specific object actually *propagated* to ASIC_DB and, when it did not, where and
 - **Presentable output** — by default `show pathtrace datapath` prints a compact ASCII-grid
   summary (pipeline table + verdict/cause/next + dependency table); `--detailed` adds the full
   per-hop view with correlated logs, and `--json` emits the complete machine-readable payload.
-- **Registry-authoring tools** (`tools/`) — a dev-only workflow that learns the real key layout of
-  a new object type from a live switch and drafts the registry entry (see below).
-- **Correctness guard** — a downstream ASIC_DB match after a genuine upstream absence is never
-  reported as healthy (found on real hardware; see below).
 - **SONiC Application Extension (SAE) package** — `sonic-package/` (manifest, Dockerfile,
   build script) and a native `show pathtrace datapath` / `show pathtrace types` CLI plugin,
   installable with `sonic-package-manager`.
@@ -98,22 +94,6 @@ specific object actually *propagated* to ASIC_DB and, when it did not, where and
 |---|---|
 | **Existed before** | Design documents only: the high-level design (`docs/architecture/pathtrace-hld.md`). No implementation. |
 | **Built during the hackathon** | Everything else in this repository: the tracer engine (resolver, walker, correlator, explainer, report, Redis backend), the declarative object registry (12 types), instance-level ASIC_DB matching, dependency tracing, audit mode, the `pathtrace` CLI, the SAE package and `show pathtrace` plugin, the registry-authoring tools, unit tests, and validation on SONiC VS and a physical switch. |
-
-### Real-hardware findings (evidence of validation)
-
-Installing and tracing on a physical switch found real defects that unit tests could not:
-
-1. A `manifest.json` field that silently broke `sonic-package-manager install`.
-2. A container mount conflict that blocked service startup.
-3. A false **Healthy** verdict — an ASIC-layer scan matched a *different* object of the same
-   type. Fixed with the anomaly guard described above.
-4. A log-correlation precision gap (unrelated syslog lines attached to a broken object).
-5. Registry hops that did not match the platform: e.g. ACL-rule rows are not persisted in this
-   build's APPL_DB. Fixed as registry data edits plus a walker fix so the verdict uses the last
-   *applicable* hop.
-
-Write-up: [`docs/verification/live-hw-verification-report.md`](docs/verification/live-hw-verification-report.md);
-console logs: [`final-hw-test-logs/`](final-hw-test-logs/).
 
 ## Usage
 
@@ -143,26 +123,6 @@ Supported intents (`pathtrace --list-types`): `acl rule <TABLE> <RULE>` · `acl 
 SONiC Redis): `pip install -e . && pathtrace --intent "..." --host <redis-host>`. Run the unit
 tests with `python3 -m pytest` (tracer and tools; no switch needed).
 
-## Registry-authoring tools (`tools/`)
-
-Adding an object type means knowing its *real* key at each layer, and the only trustworthy way
-to learn that is to configure the feature on a real switch and watch what appears in each DB
-(hand-checking against a real switch is what exposed wrong registry hops during validation).
-`tools/` automates that investigation. It is
-**dev-only and never shipped** in the SAE image.
-
-| Tool | Role |
-|---|---|
-| `discover_type.py` | Over SSH: snapshots all four DBs, runs your config command, snapshots again, diffs, and writes a **draft** YAML entry. Every hop is tagged `CONFIDENCE: HIGH/LOW` (ASIC matches by field prefix are always LOW). It then syntax-checks the draft against the real registry loader, re-traces the object live on the switch with the real walker, and emits a unit-test skeleton. Cleans up after itself. |
-| `merge_draft.py` | After human review, splices a draft into `object_types.yaml`, re-validates the merged file, runs the test suite, and rolls back automatically on failure. Supports `--dry-run`. |
-| `db_snapshot.py`, `dut_ssh.py`, `verify.py`, `yaml_draft.py` | Building blocks: `sonic-db-cli`-over-SSH snapshots/diffs, SSH/SCP connection, syntax check + live re-trace, and YAML rendering. |
-
-Safety properties: it never writes to `pathtrace/object_types.yaml` on its own (a human merges),
-asks before running the one command that mutates switch config, redacts passwords in logs,
-and runs unconfigure/cleanup in a `finally` block. Its tests need no switch, SSH or Redis
-(`pytest tools/`). Details: [`tools/README.md`](tools/README.md) and
-[`docs/guides/discover-type-guide.md`](docs/guides/discover-type-guide.md).
-
 ## How it works
 
 | Component | Role |
@@ -179,20 +139,6 @@ and runs unconfigure/cleanup in a `finally` block. Its tests need no switch, SSH
 
 The per-hop trace is deterministic database reads — ground truth, not inference.
 
-## Known limitations
-
-- **Verification status is tracked per type.** Each object type carries a `verified_on_hw` flag
-  in the registry. The OID-chain / counter-link / attribute-comparison matchers are covered by
-  unit tests against modelled SAI keyspaces; VLAN-member and QoS traces plus `audit --deps` were
-  additionally exercised on a physical Broadcom switch (installed as a sonic-package SAE), while
-  the remaining types await the manual
-  [`docs/verification/hw-verification-checklist.md`](docs/verification/hw-verification-checklist.md).
-- `acl table` can only be matched by SAI type (SAI ACL tables carry no name); the anomaly guard
-  keeps that weak match from making a missing table look healthy.
-- ACL-rule counter linking depends on orchagent populating `ACL_COUNTER_RULE_MAP`; without it
-  the tracer compares rule fields with SAI attributes and says so.
-- Dependency tracing is bounded (depth 4) and follows only edges declared in the registry.
-- Single Redis connection: multi-ASIC / chassis (per-namespace) is not yet supported.
 
 ## Future extensions (not implemented)
 
@@ -204,17 +150,8 @@ The per-hop trace is deterministic database reads — ground truth, not inferenc
 
 **Completed** for the committed scope: the intent tracer, declarative registry, instance-level
 matching, dependency tracing, audit mode (breadth + `--deps` root-cause aggregation) and SAE
-packaging are implemented and covered by 102 unit tests. ACL-rule, VLAN-member and QoS traces,
-and `audit --deps`, were validated on SONiC VS and a physical Broadcom switch (installed via
-`sonic-package-manager`); the remaining types are pending the hardware checklist above (see Known
-limitations). The future extensions are not part of this submission.
-
-## Documentation
-
-- [`docs/architecture/pathtrace-hld.md`](docs/architecture/pathtrace-hld.md) — high-level design
-- [`docs/architecture/architecture-note.md`](docs/architecture/architecture-note.md) — architecture, safety model, what real hardware taught us
-- [`docs/guides/usage-and-operations-guide.md`](docs/guides/usage-and-operations-guide.md) — every option (incl. `--deps`, `--audit`) with workflow and troubleshooting
-- [`docs/guides/user-guide.md`](docs/guides/user-guide.md) — usage · [`operations-guide.md`](docs/guides/operations-guide.md) — build & install · [`discover-type-guide.md`](docs/guides/discover-type-guide.md) — registry-authoring tools
+packaging are implemented. ACL-rule, VLAN-member and QoS traces and `audit --deps`, were 
+validated on SONiC VS and a physical Broadcom switch (installed via `sonic-package-manager`); 
 
 ## License
 Apache-2.0 — same as SONiC.

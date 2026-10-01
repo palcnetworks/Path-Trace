@@ -1,0 +1,47 @@
+{
+    "version": "1.0.0",
+    "package": {
+        "version": "0.3.0",
+        "name": "pathtrace",
+        "description": "Intent propagation tracer for the SONiC datapath (audit --deps: fleet-wide root-cause aggregation)",
+        "depends": [],
+        "base-os": {}
+    },
+    "service": {
+        "name": "pathtrace",
+        "requires": [],
+        "after": [
+            "database",
+            "swss",
+            "syncd"
+        ],
+        "before": [],
+        "dependent-of": [],
+        "asic-service": false,
+        "host-service": true,
+        "delayed": false,
+        "check_up_status": false,
+        "warm-shutdown": {
+            "after": [],
+            "before": []
+        },
+        "fast-shutdown": {
+            "after": [],
+            "before": []
+        },
+        "syslog": {
+            "support-rate-limit": false
+        }
+    },
+    "container": {
+        "privileged": false,
+        "volumes": [
+            "/var/log/syslog:/var/log/syslog:ro"
+        ],
+        "mounts": [],
+        "tmpfs": []
+    },
+    "cli": {
+        "show": "/cli/show/plugins/pathtrace.py"
+    }
+}

@@ -1,0 +1,400 @@
+# PathTrace object-type registry
+# =================================
+# Each entry defines how ONE logical object type propagates across the SONiC datapath,
+# entirely as DATA — no Python. Adding a new traceable object type means adding a block
+# here; the tracing engine (resolver -> walker -> correlator -> explainer) is unchanged.
+#
+# ---- Field reference ---------------------------------------------------------------
+# name          : object type id (snake_case)
+# match         : regex with named groups that parses the intent argument string.
+#                 The prefix (e.g. "acl rule") is given by `intent_prefix`.
+#                 Group ORDER is the argument order used when --audit builds intents.
+# intent_prefix : the leading words of the intent that select this type.
+# discriminator : python-format string over the match groups; the object's identity.
+# verified_on_hw: true only if every hop of this type has been confirmed against a real
+#                 switch. New/changed entries start false until someone runs the manual
+#                 checklist in docs/verification/hw-verification-checklist.md.
+# depends_on    : optional list of objects this one needs in order to work. Each item:
+#                   intent : format string over the match groups -> another intent
+#                   when   : optional {var: <group>, regex: <re>}; the item applies only if
+#                            the group matches; named groups in the regex become extra vars
+#                 Used by `pathtrace --deps` to walk upstream to the real root cause.
+# audit         : optional. `intent` is a format string that rebuilds an intent from a
+#                 CONFIG_DB key's parts (default: prefix + the match groups in order).
+#                 Used by `pathtrace --audit`, which enumerates CONFIG_DB keys through the
+#                 CONFIG_DB hop's key template.
+# hops          : ordered list of per-DB specs. Each hop has:
+#     db        : CONFIG_DB | APPL_DB | STATE_DB | ASIC_DB
+#     key       : format string over match groups for an exact key lookup.
+#                 Use the token {SEP} for the DB's separator; omit `key` for:
+#     asic_type : (ASIC_DB) SAI object type to scan for
+#     asic_match: (ASIC_DB) how to confirm a scanned object is THIS one (asicmatch.py):
+#                   by: key_json             SAI key is JSON; `field` == `value`   [exact]
+#                   by: oid_chain            follow OID references from a named object,
+#                                            `steps:` [{type, where, name, yield, missing}]
+#                                                                                   [exact]
+#                   by: acl_entry            ACL counter link, else attribute compare [exact/strong]
+#                   by: key_contains         substring of the SAI key                 [weak]
+#                   by: field_present_prefix any object of this SAI type              [weakest]
+#     na        : true  -> this layer legitimately doesn't hold this object type
+#     note      : human label for the layer's role
+# -----------------------------------------------------------------------------------
+
+object_types:
+
+  # ============================ existing types (hardware-checked hops) ===============
+
+  - name: acl_rule
+    intent_prefix: "acl rule"
+    match: '(?P<table>[A-Za-z0-9_]+)\s+(?P<rule>[A-Za-z0-9_]+)$'
+    discriminator: "{table}/{rule}"
+    verified_on_hw: false
+    verification_note: "hops 1-3 checked on hardware; the ASIC_DB matcher (counter link /
+      attribute compare) is new and needs the manual checklist"
+    depends_on:
+      - { intent: "acl table {table}" }
+    hops:
+      - db: CONFIG_DB
+        key: "ACL_RULE{SEP}{table}{SEP}{rule}"
+        note: "desired ACL rule"
+      - db: APPL_DB
+        na: true
+        note: "on this platform's orchagent build, ACL rules are not persisted as a per-rule
+          APPL_DB row (verified: APPL_DB has no ACL_RULE_TABLE namespace at all on a DUT with
+          a live, hardware-programmed ACL rule) -- confirm via STATE_DB instead"
+      - db: STATE_DB
+        key: "ACL_RULE_TABLE{SEP}{table}{SEP}{rule}"
+        note: "operational rule state"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_ACL_ENTRY"
+        asic_match: { by: "acl_entry", table: "{table}", rule: "{rule}" }
+        note: "programmed in silicon (instance-level: counter link, else attribute compare)"
+
+  - name: vlan_member
+    intent_prefix: "vlan member"
+    match: '(?P<vlan>\d+)\s+(?P<port>[A-Za-z0-9]+)$'
+    discriminator: "Vlan{vlan}/{port}"
+    verified_on_hw: false
+    verification_note: "hops 1-3 checked on hardware; the ASIC_DB OID chain is new and needs
+      the manual checklist"
+    depends_on:
+      - { intent: "vlan {vlan}" }
+      - { intent: "port {port}", when: { var: port, regex: '^Ethernet\d+$' } }
+      - { intent: "portchannel {port}", when: { var: port, regex: '^PortChannel\d+$' } }
+    hops:
+      - db: CONFIG_DB
+        key: "VLAN_MEMBER{SEP}Vlan{vlan}{SEP}{port}"
+        note: "desired VLAN membership"
+      - db: APPL_DB
+        key: "VLAN_MEMBER_TABLE{SEP}Vlan{vlan}{SEP}{port}"
+        note: "membership handed to orchagent"
+      - db: STATE_DB
+        na: true
+        note: "(no dedicated STATE_DB entry for VLAN member)"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_VLAN_MEMBER"
+        asic_match:
+          by: "oid_chain"
+          steps:
+            - { type: "SAI_OBJECT_TYPE_HOSTIF", name: "port_obj", yield: "SAI_HOSTIF_ATTR_OBJ_ID",
+                where: { SAI_HOSTIF_ATTR_NAME: "{port}" },
+                missing: "{port} has no host interface in ASIC_DB (port unknown to SAI)" }
+            - { type: "SAI_OBJECT_TYPE_BRIDGE_PORT", name: "bridge_port",
+                where: { SAI_BRIDGE_PORT_ATTR_PORT_ID: "@port_obj" },
+                missing: "{port} has no bridge port (not a switchport in the default bridge)" }
+            - { type: "SAI_OBJECT_TYPE_VLAN", name: "vlan_obj",
+                where: { SAI_VLAN_ATTR_VLAN_ID: "{vlan}" },
+                missing: "VLAN {vlan} does not exist in ASIC_DB" }
+            - { type: "SAI_OBJECT_TYPE_VLAN_MEMBER",
+                where: { SAI_VLAN_MEMBER_ATTR_VLAN_ID: "@vlan_obj",
+                         SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID: "@bridge_port" },
+                missing: "VLAN {vlan} and {port} both exist, but no VLAN member links them" }
+        note: "programmed in silicon (exact: VLAN id + port bridge-port OID chain)"
+
+  # ============================ new types (need the hardware checklist) ==============
+
+  - name: port
+    intent_prefix: "port"
+    match: '(?P<port>Ethernet\d+)$'
+    discriminator: "{port}"
+    verified_on_hw: false
+    verification_note: "schema from SONiC sources; run the manual checklist"
+    hops:
+      - db: CONFIG_DB
+        key: "PORT{SEP}{port}"
+        note: "desired port"
+      - db: APPL_DB
+        key: "PORT_TABLE{SEP}{port}"
+        note: "port handed to orchagent"
+      - db: STATE_DB
+        key: "PORT_TABLE{SEP}{port}"
+        note: "operational port state"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_HOSTIF"
+        asic_match:
+          by: "oid_chain"
+          steps:
+            - { type: "SAI_OBJECT_TYPE_HOSTIF", where: { SAI_HOSTIF_ATTR_NAME: "{port}" },
+                missing: "no host interface named {port} in ASIC_DB (SAI never created the port)" }
+        note: "port netdev programmed in silicon (exact: host interface name)"
+
+  - name: vlan
+    intent_prefix: "vlan"
+    match: '(?P<vlan>\d+)$'
+    discriminator: "Vlan{vlan}"
+    verified_on_hw: false
+    verification_note: "STATE_DB key assumed from vlanmgrd; run the manual checklist"
+    hops:
+      - db: CONFIG_DB
+        key: "VLAN{SEP}Vlan{vlan}"
+        note: "desired VLAN"
+      - db: APPL_DB
+        key: "VLAN_TABLE{SEP}Vlan{vlan}"
+        note: "VLAN handed to orchagent"
+      - db: STATE_DB
+        key: "VLAN_TABLE{SEP}Vlan{vlan}"
+        note: "VLAN operational state (vlanmgrd)"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_VLAN"
+        asic_match:
+          by: "oid_chain"
+          steps:
+            - { type: "SAI_OBJECT_TYPE_VLAN", where: { SAI_VLAN_ATTR_VLAN_ID: "{vlan}" },
+                missing: "VLAN {vlan} does not exist in ASIC_DB" }
+        note: "programmed in silicon (exact: VLAN id)"
+
+  - name: portchannel
+    intent_prefix: "portchannel"
+    match: '(?P<lag>PortChannel\d+)$'
+    discriminator: "{lag}"
+    verified_on_hw: false
+    verification_note: "schema from SONiC sources; run the manual checklist"
+    hops:
+      - db: CONFIG_DB
+        key: "PORTCHANNEL{SEP}{lag}"
+        note: "desired port channel"
+      - db: APPL_DB
+        key: "LAG_TABLE{SEP}{lag}"
+        note: "LAG handed to orchagent (teamd/teammgrd)"
+      - db: STATE_DB
+        key: "LAG_TABLE{SEP}{lag}"
+        note: "LAG operational state"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_LAG"
+        asic_match:
+          by: "oid_chain"
+          steps:
+            - { type: "SAI_OBJECT_TYPE_HOSTIF", name: "lag_obj", yield: "SAI_HOSTIF_ATTR_OBJ_ID",
+                where: { SAI_HOSTIF_ATTR_NAME: "{lag}" },
+                missing: "no host interface named {lag} in ASIC_DB" }
+            - { type: "SAI_OBJECT_TYPE_LAG", where: { __oid__: "@lag_obj" },
+                missing: "host interface {lag} exists but its LAG object is missing" }
+        note: "LAG programmed in silicon (exact: host interface -> LAG OID)"
+
+  - name: vlan_interface
+    intent_prefix: "vlan interface"
+    match: '(?P<vlan>\d+)$'
+    discriminator: "Vlan{vlan}"
+    verified_on_hw: false
+    verification_note: "SVI keys from SONiC sources; the router-interface OID chain is new;
+      run the manual checklist"
+    depends_on:
+      - { intent: "vlan {vlan}" }
+    hops:
+      - db: CONFIG_DB
+        key: "VLAN_INTERFACE{SEP}Vlan{vlan}"
+        note: "desired VLAN interface (SVI); created when an IP is added to VlanN"
+      - db: APPL_DB
+        key: "INTF_TABLE{SEP}Vlan{vlan}"
+        note: "SVI handed to orchagent (intfmgrd)"
+      - db: STATE_DB
+        na: true
+        note: "(STATE_DB key for VLAN interfaces not verified on hardware -- skipped rather
+          than risk a false break)"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_ROUTER_INTERFACE"
+        asic_match:
+          by: "oid_chain"
+          steps:
+            - { type: "SAI_OBJECT_TYPE_VLAN", name: "vlan_obj",
+                where: { SAI_VLAN_ATTR_VLAN_ID: "{vlan}" },
+                missing: "VLAN {vlan} does not exist in ASIC_DB" }
+            - { type: "SAI_OBJECT_TYPE_ROUTER_INTERFACE",
+                where: { SAI_ROUTER_INTERFACE_ATTR_TYPE: "SAI_ROUTER_INTERFACE_TYPE_VLAN",
+                         SAI_ROUTER_INTERFACE_ATTR_VLAN_ID: "@vlan_obj" },
+                missing: "VLAN {vlan} exists, but no VLAN-type router interface references it" }
+        note: "SVI programmed in silicon (exact: VLAN-type router interface -> VLAN OID)"
+
+  # ============================ QoS (unit-tested; need the hardware checklist) =======
+  # orchagent's QoS orch consumes these CONFIG_DB tables directly, so APPL_DB/STATE_DB hops
+  # are n/a. The interesting hop is ASIC_DB: is the configured content really in silicon?
+
+  - name: qos_map
+    intent_prefix: "qos map"
+    match: '(?P<table>DSCP_TO_TC_MAP|TC_TO_QUEUE_MAP|TC_TO_PRIORITY_GROUP_MAP|PFC_PRIORITY_TO_QUEUE_MAP)\s+(?P<name>[A-Za-z0-9_.\-]+)$'
+    discriminator: "{table}/{name}"
+    verified_on_hw: false
+    verification_note: "SAI QOS_MAP entry-list layout is from sairedis serialization; run the
+      manual checklist"
+    audit: { scan_prefixes: ["DSCP_TO_TC_MAP|", "TC_TO_QUEUE_MAP|", "TC_TO_PRIORITY_GROUP_MAP|",
+                             "PFC_PRIORITY_TO_QUEUE_MAP|"] }
+    hops:
+      - db: CONFIG_DB
+        key: "{table}{SEP}{name}"
+        note: "desired QoS map (key -> value entries)"
+      - db: APPL_DB
+        na: true
+        note: "(qosorch reads this CONFIG_DB table directly)"
+      - db: STATE_DB
+        na: true
+        note: "(no STATE_DB entry for QoS maps)"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_QOS_MAP"
+        asic_match: { by: "qos_map", table: "{table}", name: "{name}" }
+        note: "QoS map in silicon (exact: SAI map type and every key/value entry equal CONFIG_DB)"
+
+  - name: scheduler
+    intent_prefix: "scheduler"
+    match: '(?P<name>[A-Za-z0-9_.\-]+)$'
+    discriminator: "{name}"
+    verified_on_hw: false
+    verification_note: "SAI scheduler attributes from SAI definitions; run the manual checklist"
+    hops:
+      - db: CONFIG_DB
+        key: "SCHEDULER{SEP}{name}"
+        note: "desired scheduler profile"
+      - db: APPL_DB
+        na: true
+        note: "(qosorch reads this CONFIG_DB table directly)"
+      - db: STATE_DB
+        na: true
+        note: "(no STATE_DB entry for schedulers)"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_SCHEDULER"
+        asic_match:
+          by: "config_attrs"
+          config_key: "SCHEDULER|{name}"
+          fields:
+            - { cfg: "type", attr: "SAI_SCHEDULER_ATTR_SCHEDULING_TYPE", kind: "map",
+                map: { STRICT: "SAI_SCHEDULING_TYPE_STRICT", WRR: "SAI_SCHEDULING_TYPE_WRR",
+                       DWRR: "SAI_SCHEDULING_TYPE_DWRR" } }
+            - { cfg: "weight", attr: "SAI_SCHEDULER_ATTR_SCHEDULING_WEIGHT", kind: "int" }
+        note: "scheduler in silicon (attribute match: scheduling type and weight)"
+
+  - name: wred_profile
+    intent_prefix: "wred profile"
+    match: '(?P<name>[A-Za-z0-9_.\-]+)$'
+    discriminator: "{name}"
+    verified_on_hw: false
+    verification_note: "SAI WRED attributes from SAI definitions; run the manual checklist"
+    hops:
+      - db: CONFIG_DB
+        key: "WRED_PROFILE{SEP}{name}"
+        note: "desired WRED / ECN profile"
+      - db: APPL_DB
+        na: true
+        note: "(qosorch reads this CONFIG_DB table directly)"
+      - db: STATE_DB
+        na: true
+        note: "(no STATE_DB entry for WRED profiles)"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_WRED"
+        asic_match:
+          by: "config_attrs"
+          config_key: "WRED_PROFILE|{name}"
+          fields:
+            - { cfg: "wred_green_enable", attr: "SAI_WRED_ATTR_GREEN_ENABLE", kind: "bool" }
+            - { cfg: "wred_yellow_enable", attr: "SAI_WRED_ATTR_YELLOW_ENABLE", kind: "bool" }
+            - { cfg: "wred_red_enable", attr: "SAI_WRED_ATTR_RED_ENABLE", kind: "bool" }
+            - { cfg: "green_min_threshold", attr: "SAI_WRED_ATTR_GREEN_MIN_THRESHOLD", kind: "int" }
+            - { cfg: "green_max_threshold", attr: "SAI_WRED_ATTR_GREEN_MAX_THRESHOLD", kind: "int" }
+            - { cfg: "green_drop_probability", attr: "SAI_WRED_ATTR_GREEN_DROP_PROBABILITY", kind: "int" }
+            - { cfg: "yellow_min_threshold", attr: "SAI_WRED_ATTR_YELLOW_MIN_THRESHOLD", kind: "int" }
+            - { cfg: "yellow_max_threshold", attr: "SAI_WRED_ATTR_YELLOW_MAX_THRESHOLD", kind: "int" }
+            - { cfg: "yellow_drop_probability", attr: "SAI_WRED_ATTR_YELLOW_DROP_PROBABILITY", kind: "int" }
+            - { cfg: "red_min_threshold", attr: "SAI_WRED_ATTR_RED_MIN_THRESHOLD", kind: "int" }
+            - { cfg: "red_max_threshold", attr: "SAI_WRED_ATTR_RED_MAX_THRESHOLD", kind: "int" }
+            - { cfg: "red_drop_probability", attr: "SAI_WRED_ATTR_RED_DROP_PROBABILITY", kind: "int" }
+            - { cfg: "ecn", attr: "SAI_WRED_ATTR_ECN_MARK_MODE", kind: "map",
+                map: { ecn_none: "SAI_ECN_MARK_MODE_NONE", ecn_green: "SAI_ECN_MARK_MODE_GREEN",
+                       ecn_yellow: "SAI_ECN_MARK_MODE_YELLOW", ecn_red: "SAI_ECN_MARK_MODE_RED",
+                       ecn_green_yellow: "SAI_ECN_MARK_MODE_GREEN_YELLOW",
+                       ecn_green_red: "SAI_ECN_MARK_MODE_GREEN_RED",
+                       ecn_yellow_red: "SAI_ECN_MARK_MODE_YELLOW_RED",
+                       ecn_all: "SAI_ECN_MARK_MODE_ALL" } }
+        note: "WRED profile in silicon (attribute match: enables, thresholds, drop probability, ECN mode)"
+
+  - name: buffer_profile
+    intent_prefix: "buffer profile"
+    match: '(?P<name>[A-Za-z0-9_.\-]+)$'
+    discriminator: "{name}"
+    verified_on_hw: false
+    verification_note: "APPL_DB key (buffermgrd) and SAI buffer profile attributes are from
+      sources; run the manual checklist"
+    hops:
+      - db: CONFIG_DB
+        key: "BUFFER_PROFILE{SEP}{name}"
+        note: "desired buffer profile"
+      - db: APPL_DB
+        key: "BUFFER_PROFILE_TABLE{SEP}{name}"
+        note: "profile handed to orchagent (buffermgrd)"
+      - db: STATE_DB
+        na: true
+        note: "(no STATE_DB entry for buffer profiles)"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_BUFFER_PROFILE"
+        asic_match:
+          by: "config_attrs"
+          config_key: "BUFFER_PROFILE|{name}"
+          fields:
+            - { cfg: "size", attr: "SAI_BUFFER_PROFILE_ATTR_RESERVED_BUFFER_SIZE", kind: "int" }
+            - { cfg: "xon", attr: "SAI_BUFFER_PROFILE_ATTR_XON_TH", kind: "int" }
+            - { cfg: "xoff", attr: "SAI_BUFFER_PROFILE_ATTR_XOFF_TH", kind: "int" }
+            - { cfg: "dynamic_th", attr: "SAI_BUFFER_PROFILE_ATTR_SHARED_DYNAMIC_TH", kind: "int" }
+            - { cfg: "static_th", attr: "SAI_BUFFER_PROFILE_ATTR_SHARED_STATIC_TH", kind: "int" }
+        note: "buffer profile in silicon (attribute match: size, xon/xoff, shared threshold)"
+
+  - name: port_qos
+    intent_prefix: "port qos"
+    match: '(?P<port>Ethernet\d+)$'
+    discriminator: "{port}"
+    verified_on_hw: false
+    verification_note: "SAI port QoS attribute names are from SAI definitions; run the manual
+      checklist"
+    depends_on:
+      - { intent: "port {port}" }
+    hops:
+      - db: CONFIG_DB
+        key: "PORT_QOS_MAP{SEP}{port}"
+        note: "desired QoS map bindings for the port"
+      - db: APPL_DB
+        na: true
+        note: "(qosorch reads this CONFIG_DB table directly)"
+      - db: STATE_DB
+        na: true
+        note: "(no STATE_DB entry for port QoS bindings)"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_PORT"
+        asic_match: { by: "port_qos", port: "{port}" }
+        note: "port bound to the right QoS maps in silicon (exact: host interface -> port OID -> QoS map OIDs, contents equal CONFIG_DB)"
+
+  - name: acl_table
+    intent_prefix: "acl table"
+    match: '(?P<table>[A-Za-z0-9_]+)$'
+    discriminator: "{table}"
+    verified_on_hw: false
+    verification_note: "schema from SONiC sources; ASIC_DB match is type-level only"
+    hops:
+      - db: CONFIG_DB
+        key: "ACL_TABLE{SEP}{table}"
+        note: "desired ACL table"
+      - db: APPL_DB
+        na: true
+        note: "ACL tables are not persisted in APPL_DB on the tested build"
+      - db: STATE_DB
+        key: "ACL_TABLE_TABLE{SEP}{table}"
+        note: "operational ACL table state"
+      - db: ASIC_DB
+        asic_type: "SAI_OBJECT_TYPE_ACL_TABLE"
+        asic_match: { by: "field_present_prefix", value: "SAI_ACL_TABLE_ATTR_" }
+        note: "SAI ACL tables carry no name -- matched by SAI type only (type-level, weakest)"

@@ -92,7 +92,7 @@ specific object actually *propagated* to ASIC_DB and, when it did not, where and
 
 | | |
 |---|---|
-| **Existed before** | Design documents only: the high-level design (`docs/architecture/pathtrace-hld.md`). No implementation. |
+| **Existed before** | Design documents only: the high-level design (`docs/pathtrace-hld.md`). No implementation. |
 | **Built during the hackathon** | Everything else in this repository: the tracer engine (resolver, walker, correlator, explainer, report, Redis backend), the declarative object registry (12 types), instance-level ASIC_DB matching, dependency tracing, audit mode, the `pathtrace` CLI, the SAE package and `show pathtrace` plugin, the registry-authoring tools, unit tests, and validation on SONiC VS and a physical switch. |
 
 ## Usage
